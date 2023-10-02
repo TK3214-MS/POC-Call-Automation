@@ -1,4 +1,4 @@
-k# アーキテクチャー
+# アーキテクチャー
 今回のアーキテクチャーは以下の通りです。
 
 ![00](https://github.com/TK3214-MS/POC-Call-Automation/assets/89323076/c5e3e1ca-b88c-40b7-8be3-e519ffb9f340)
