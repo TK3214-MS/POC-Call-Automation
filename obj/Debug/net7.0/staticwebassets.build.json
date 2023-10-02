@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "li9hDLm5BiRRAW7eLhI/s/SbAQuNXRzLEuzPjlYnR08=",
+  "Source": "CallAutomationOpenAI",
+  "BasePath": "_content/CallAutomationOpenAI",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
