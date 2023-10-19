@@ -7,6 +7,9 @@ using Azure.Messaging.EventGrid.SystemEvents;
 using Azure.Messaging;
 using Azure;
 using Azure.AI.OpenAI;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using System.Text.Unicode;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -157,6 +160,7 @@ async Task<string> GetChatGPTResponse(string speech_input)
 
     var ai_client = new OpenAIClient(new Uri(endpoint), new AzureKeyCredential(key));
     //var ai_client = new OpenAIClient(openAIApiKey: ""); //Use this initializer if you're using a non-Azure OpenAI API Key
+    
 
     var chatCompletionsOptions = new ChatCompletionsOptions()
     {
@@ -167,11 +171,62 @@ async Task<string> GetChatGPTResponse(string speech_input)
         MaxTokens = 1000
     };
 
-    Response<ChatCompletions> response = await ai_client.GetChatCompletionsAsync(
-        deploymentOrModelName: builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"),
-        chatCompletionsOptions);
+    ChatCompletions response;
+    ChatChoice responseChoice;
 
-    var response_content = response.Value.Choices[0].Message.Content;
+    // 使用する Function を定義する
+    FunctionDefinition getWeatherFuntionDefinition = GetWeatherFunction.GetFunctionDefinition();
+    FunctionDefinition getCapitalFuntionDefinition = GetCapitalFunction.GetFunctionDefinition();
+    chatCompletionsOptions.Functions.Add(getWeatherFuntionDefinition);
+    chatCompletionsOptions.Functions.Add(getCapitalFuntionDefinition);
+
+    // Response<ChatCompletions> response = await ai_client.GetChatCompletionsAsync(
+    //     deploymentOrModelName: builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"),
+    //     chatCompletionsOptions
+    // );
+
+    response = await ai_client.GetChatCompletionsAsync(builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"), chatCompletionsOptions);
+
+    // function_call を行うか判別する
+    responseChoice = response.Choices[0];
+
+    // function_call のうちはループを回す
+    while (responseChoice.FinishReason == CompletionsFinishReason.FunctionCall)
+    {
+        // Add message as a history.
+        chatCompletionsOptions.Messages.Add(responseChoice.Message);
+
+        if (responseChoice.Message.FunctionCall.Name == GetWeatherFunction.Name)
+        {
+            string unvalidatedArguments = responseChoice.Message.FunctionCall.Arguments;
+            WeatherInput input = JsonSerializer.Deserialize<WeatherInput>(unvalidatedArguments,
+                    new JsonSerializerOptions() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase })!;
+            var functionResultData = GetWeatherFunction.GetWeather(input.Location, input.Unit);
+            var functionResponseMessage = new ChatMessage(
+                ChatRole.Function,
+                JsonSerializer.Serialize(
+                    functionResultData,
+                    new JsonSerializerOptions() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+            functionResponseMessage.Name = GetWeatherFunction.Name;
+            chatCompletionsOptions.Messages.Add(functionResponseMessage);
+        }
+        // Call LLM again to generate the response.
+        // response =
+        //     await client.GetChatCompletionsAsync(
+        //         model,
+        //         chatCompletionsOptions);
+
+        response = await ai_client.GetChatCompletionsAsync(
+            deploymentOrModelName: builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"),
+            chatCompletionsOptions
+        );
+
+        responseChoice = response.Choices[0];
+    }
+
+    // 最終的な出力
+    // var response_content = response.Value.Choices[0].Message.Content;
+    var response_content = responseChoice.Message.Content;
 
     return response_content;
 }
