@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using Azure.Communication;
 using Azure.Communication.CallAutomation;
@@ -24,6 +25,54 @@ var app = builder.Build();
 
 var devTunnelUri = builder.Configuration.GetValue<string>("DevTunnelUri");
 var maxTimeout = 2;
+
+static FunctionDefinition GetFunctionDefinition()
+{
+    return new FunctionDefinition()
+    {
+        Name = "microsoft_search_api",
+        Description = "手順やルールのドキュメントに関する質問をされるとMicrosoft Graph Search APIを用いて検索をします。",
+        Parameters = BinaryData.FromObjectAsJson(
+        new
+        {
+            Type = "object",
+            Properties = new
+            {
+                Requests = new
+                {
+                    Type = "object",
+                    Properties = new
+                    {
+                        EntityTypes = new
+                        {
+                            Type = "array",
+                            Description = "検索の対象にするリソースの種類。不明な場合はすべての項目を含めます。",
+                            Items = new
+                            {
+                                Type = "string",
+                                Enum = new[] { "site", "list", "listItem", "drive", "driveItem", "message", "event" }
+                            }
+                        },
+                        Query = new
+                        {
+                            Type = "object",
+                            Properties = new
+                            {
+                                QueryString = new
+                                {
+                                    Type = "string",
+                                    Description = "検索キーワード。半角スペース区切り。"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            Required = new[] { "requests" },
+        },
+        new JsonSerializerOptions() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }),
+    };
+}
 
 app.MapGet("/", () => "Hello ACS CallAutomation!");
 
@@ -150,6 +199,26 @@ async Task HandleChatResponse(string chatResponse, CallMedia callConnectionMedia
     var recognize_result = await callConnectionMedia.StartRecognizingAsync(recognizeOptions);
 }
 
+async Task<string> CallMicrosoftSearchAsync(SearchInput input)
+{
+    // エンドポイントとHttpClientを設定
+    // var endpoint = "https://call-app-sample.azurewebsites.net/api/MicrosoftSearch?code=DZxos3eTCDgYiUzXwgQTfLGvnd2uZvjxXLtxFk1quwwuAzFu3JAJjg==";
+    var endpoint = builder.Configuration.GetValue<string>("FunctionsEndpoint");
+    var httpClient = new HttpClient();
+
+    // inputオブジェクトをJSONにシリアル化
+    var jsonContent = JsonSerializer.Serialize(input);
+    var httpContent = new StringContent(jsonContent, System.Text.Encoding.UTF8, "application/json");
+
+    // POSTリクエストを実行
+    var httpResponse = await httpClient.PostAsync(endpoint, httpContent);
+
+    // 応答をチェックし、応答コンテンツを返す
+    httpResponse.EnsureSuccessStatusCode();
+    var responseContent = await httpResponse.Content.ReadAsStringAsync();
+    return responseContent;
+}
+
 async Task<string> GetChatGPTResponse(string speech_input)
 {
     var key = builder.Configuration.GetValue<string>("AzureOpenAIServiceKey");
@@ -158,20 +227,75 @@ async Task<string> GetChatGPTResponse(string speech_input)
     var ai_client = new OpenAIClient(new Uri(endpoint), new AzureKeyCredential(key));
     //var ai_client = new OpenAIClient(openAIApiKey: ""); //Use this initializer if you're using a non-Azure OpenAI API Key
 
+    // var chatCompletionsOptions = new ChatCompletionsOptions()
+    // {
+    //     Messages = {
+    //         new ChatMessage(ChatRole.System, "あなたは顧客の困りごとを解決する AI アシスタントです。ユーザーの質問に対して、100文字以内で答えてください。また、リンクの情報を回答する際は、URLは回答から削除してください。"),
+    //         new ChatMessage(ChatRole.User, $"次の質問に対して、100文字以内で答えて: '{speech_input}?'。回答にURLを含む場合は、URLを削除してタイトルのみ回答に含むようにして。"),
+    //                 },
+    //     MaxTokens = 50 // 100文字を目安にトークン数を設定。実際のトークン数は要調整。
+    // };
+
     var chatCompletionsOptions = new ChatCompletionsOptions()
     {
         Messages = {
-            new ChatMessage(ChatRole.System, "あなたは顧客の困りごとを解決する AI アシスタントです。"),
-            new ChatMessage(ChatRole.User, $"200文字以下で次の質問に日本語で答えて下さい。また日本語以外の質問と認識した場合は聞き返して下さい。: {speech_input}?"),
+            new ChatMessage(ChatRole.System, "あなたは顧客の困りごとを解決する AI アシスタントです。回答には、具体的なドキュメント名を提供してください。回答は100文字以内で、URLや余分な情報は削除してドキュメント名のみを含めてください。"),
+            new ChatMessage(ChatRole.User, $"次の質問に対して、100文字以内で答えて: '{speech_input}?'。"),
                     },
-        MaxTokens = 1000
+        MaxTokens = 100
     };
 
-    Response<ChatCompletions> response = await ai_client.GetChatCompletionsAsync(
-        deploymentOrModelName: builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"),
-        chatCompletionsOptions);
+    ChatCompletions response;
+    ChatChoice responseChoice;
 
-    var response_content = response.Value.Choices[0].Message.Content;
+
+    // 使用する Function を定義する
+    FunctionDefinition getMicrosoftSearchApi = GetFunctionDefinition();
+    chatCompletionsOptions.Functions.Add(getMicrosoftSearchApi);
+
+    response = await ai_client.GetChatCompletionsAsync(builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"), chatCompletionsOptions);
+
+    // function_call を行うか判別する
+    responseChoice = response.Choices[0];
+
+    // function_call のうちはループを回す
+    while (responseChoice.FinishReason == CompletionsFinishReason.FunctionCall)
+    {
+        // Add message as a history.
+        chatCompletionsOptions.Messages.Add(responseChoice.Message);
+
+        if (responseChoice.Message.FunctionCall.Name == MicrosoftSearchApiFunction.Name)
+        {
+            Console.WriteLine($"呼び出す関数: {MicrosoftSearchApiFunction.Name}");
+            string unvalidatedArguments = responseChoice.Message.FunctionCall.Arguments;
+            Console.WriteLine($"引数: {unvalidatedArguments}");
+            SearchInput input = JsonSerializer.Deserialize<SearchInput>(unvalidatedArguments,
+                    new JsonSerializerOptions() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase })!;
+            Console.WriteLine($"インプット: {input}");
+            var functionResultData = CallMicrosoftSearchAsync(input);
+            var functionResponseMessage = new ChatMessage(
+                ChatRole.Function,
+                JsonSerializer.Serialize(
+                    functionResultData,
+                    new JsonSerializerOptions() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+            functionResponseMessage.Name = MicrosoftSearchApiFunction.Name;
+            chatCompletionsOptions.Messages.Add(functionResponseMessage);
+        }
+
+        Console.WriteLine($"Function call: {chatCompletionsOptions.Messages}");
+
+        response = await ai_client.GetChatCompletionsAsync(
+            deploymentOrModelName: builder.Configuration.GetValue<string>("AzureOpenAIDeploymentModelName"),
+            chatCompletionsOptions
+        );
+
+        responseChoice = response.Choices[0];
+    }
+
+    // 最終的な出力
+    var response_content = responseChoice.Message.Content;
+
+    Console.WriteLine($"最終的な出力: {response_content}");
 
     return response_content;
 }
