@@ -26,6 +26,7 @@ var app = builder.Build();
 var devTunnelUri = builder.Configuration.GetValue<string>("DevTunnelUri");
 var maxTimeout = 2;
 
+
 static FunctionDefinition GetFunctionDefinition()
 {
     return new FunctionDefinition()
@@ -110,25 +111,52 @@ app.MapPost("/api/incomingCall", async (
         AnswerCallResult answerCallResult = await client.AnswerCallAsync(options);
         Console.WriteLine($"Answered call for connection id: {answerCallResult.CallConnection.CallConnectionId}");
 
+        // // レコーディングの開始
+        // // var serverCallId = answerCallResult.CallConnection.CallConnectionId;
+        // var serverCallId = answerCallResult.CallConnectionProperties.ServerCallId;
+        // logger.LogInformation($"serverCallId -- > {serverCallId}");
+        // StartRecordingOptions recordingOptions = new StartRecordingOptions(new ServerCallLocator(serverCallId));
+        // var callRecording = client.GetCallRecording();
+        // var startResponse = await callRecording.StartAsync(recordingOptions).ConfigureAwait(false);
+        // var recordingId = startResponse.Value.RecordingId;
+
+
+        string recordingId = "";
         //Use EventProcessor to process CallConnected event
         var answer_result = await answerCallResult.WaitForEventProcessorAsync();
         if (answer_result.IsSuccess)
         {
             Console.WriteLine($"Call connected event received for connection id: {answer_result.SuccessResult.CallConnectionId}");
+
+            // レコーディングの開始
+            // var serverCallId = answerCallResult.CallConnectionProperties.ServerCallId;
+            var serverCallId = client.GetCallConnection(answer_result.SuccessResult.CallConnectionId).GetCallConnectionProperties().Value.ServerCallId;
+            logger.LogInformation($"serverCallId -- > {serverCallId}");
+            StartRecordingOptions recordingOptions = new StartRecordingOptions(new ServerCallLocator(serverCallId));
+            // var callRecording = client.GetCallRecording();
+            // var startResponse = await callRecording.StartAsync(recordingOptions).ConfigureAwait(false);
+            var startResponse = await client.GetCallRecording().StartAsync(recordingOptions);
+            recordingId = startResponse.Value.RecordingId;
+
+
             var callConnectionMedia = answerCallResult.CallConnection.GetCallMedia();
             await HandleRecognizeAsync(callConnectionMedia, callerId, "お電話ありがとうございます。何をお手伝いしましょう？");
+            var statusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
+            logger.LogInformation($"GetRecordingStateAsync response -- > {statusResponse}");
+            logger.LogInformation($"response -- > {startResponse}");
+            logger.LogInformation($"recordingId -- > {recordingId}");
         }
 
         client.GetEventProcessor().AttachOngoingEventProcessor<PlayCompleted>(answerCallResult.CallConnection.CallConnectionId, async (playCompletedEvent) =>
         {
             Console.WriteLine($"Play completed event received for connection id: {playCompletedEvent.CallConnectionId}. Hanging up call...");
-            await HandleHangupAsync(answerCallResult.CallConnection);
+            await HandleHangupAsync(answerCallResult.CallConnection, recordingId);
         });
 
         client.GetEventProcessor().AttachOngoingEventProcessor<PlayFailed>(answerCallResult.CallConnection.CallConnectionId, async (playFailedEvent) =>
         {
             Console.WriteLine($"Play failed event received for connection id: {playFailedEvent.CallConnectionId}. Hanging up call...");
-            await HandleHangupAsync(answerCallResult.CallConnection);
+            await HandleHangupAsync(answerCallResult.CallConnection, answerCallResult.CallConnectionProperties.ServerCallId);
         });
 
         client.GetEventProcessor().AttachOngoingEventProcessor<RecognizeCompleted>(answerCallResult.CallConnection.CallConnectionId, async (recognizeCompletedEvent) =>
@@ -142,6 +170,14 @@ app.MapPost("/api/incomingCall", async (
                 var chatGPTResponse = await GetChatGPTResponse(speech_result?.Speech);
                 await HandleChatResponse(chatGPTResponse, answerCallResult.CallConnection.GetCallMedia(), callerId, logger);
             }
+
+            var finishStatusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
+            Console.WriteLine($"Finish GetRecordingStateAsync response -- > {finishStatusResponse}");
+            // レコーディングの停止
+            Console.WriteLine($"finish recordingId -- > {recordingId}");
+            client.GetCallRecording().Stop(recordingId);
+            Console.WriteLine($"finish recording");
+            await answerCallResult.CallConnection.HangUpAsync(true);
         });
 
         client.GetEventProcessor().AttachOngoingEventProcessor<RecognizeFailed>(answerCallResult.CallConnection.CallConnectionId, async (recognizeFailedEvent) =>
@@ -157,9 +193,16 @@ app.MapPost("/api/incomingCall", async (
             else
             {
                 Console.WriteLine($"Recognize failed event received for connection id: {recognizeFailedEvent.CallConnectionId}. Playing goodbye message...");
-                await HandlePlayAsync(callConnectionMedia);
+                await HandlePlayAsync(callConnectionMedia, answerCallResult.CallConnectionProperties.ServerCallId);
             }
         });
+
+        // client.GetEventProcessor().AttachOngoingEventProcessor<CallDisconnected>(answerCallResult.CallConnection.CallConnectionId, async (callDisconnectedEvent) =>
+        // {
+        //     Console.WriteLine($"Call disconnected event received for connection id: {callDisconnectedEvent.CallConnectionId}. Stopping recording...");
+        //     // var finishStatusResponse = await client.GetCallRecording().GetStateAsync(recordingId).ConfigureAwait(false);
+        // });
+
     }
     return Results.Ok();
 });
@@ -175,6 +218,43 @@ app.MapPost("/api/callbacks/{contextId}", async (
     var eventProcessor = client.GetEventProcessor();
     eventProcessor.ProcessEvents(cloudEvents);
     return Results.Ok();
+});
+
+app.MapPost("/api/recordingFileStatus", (
+    [FromBody] EventGridEvent[] eventGridEvents) =>
+{
+    foreach (var eventGridEvent in eventGridEvents)
+    {
+        if (eventGridEvent.TryGetSystemEventData(out object eventData))
+        {
+            // Handle the webhook subscription validation event.
+            if (eventData is SubscriptionValidationEventData subscriptionValidationEventData)
+            {
+                var responseData = new SubscriptionValidationResponse
+                {
+                    ValidationResponse = subscriptionValidationEventData.ValidationCode
+                };
+                return Results.Ok(responseData);
+            }
+
+            // Handle the ACS Recording File Status Updated event.
+            if (eventData is AcsRecordingFileStatusUpdatedEventData statusUpdated)
+            {
+                var contentLocation = statusUpdated.RecordingStorageInfo.RecordingChunks[0].ContentLocation;
+                var deleteLocation = statusUpdated.RecordingStorageInfo.RecordingChunks[0].DeleteLocation;
+                Console.WriteLine($"Recording Download Location : {contentLocation}, Recording Delete Location: {deleteLocation}");
+            }
+        }
+    }
+    return Results.Ok("Recording File Status Updated event processed successfully.");
+});
+
+app.MapGet("/api/download", async (HttpContext context) =>
+{
+    var url = context.Request.Query["url"].ToString();
+    var filename = context.Request.Query["filename"].ToString();
+    var recordingDownloadUri = new Uri(url);
+    var response = await client.GetCallRecording().DownloadToAsync(recordingDownloadUri, filename);
 });
 
 async Task HandleChatResponse(string chatResponse, CallMedia callConnectionMedia, string callerId, ILogger logger)
@@ -323,7 +403,7 @@ async Task HandleRecognizeAsync(CallMedia callConnectionMedia, string callerId, 
     var recognize_result = await callConnectionMedia.StartRecognizingAsync(recognizeOptions);
 }
 
-async Task HandlePlayAsync(CallMedia callConnectionMedia)
+async Task HandlePlayAsync(CallMedia callConnectionMedia, string recordingId)
 {
     // Play goodbye message
     var GoodbyePlaySource = new TextSource("お電話ありがとうございました。失礼致します。")
@@ -334,14 +414,26 @@ async Task HandlePlayAsync(CallMedia callConnectionMedia)
     await callConnectionMedia.PlayToAllAsync(GoodbyePlaySource);
 }
 
-async Task HandleHangupAsync(CallConnection callConnection)
+async Task HandleHangupAsync(CallConnection callConnection, string recordingId)
 {
     var GoodbyePlaySource = new TextSource("お電話ありがとうございました。失礼致します。")
     {
         VoiceName = "ja-JP-DaichiNeural"
     };
 
+    // var finishStatusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
+    // Console.WriteLine($"GetRecordingStateAsync response -- > {finishStatusResponse}");
+    // // レコーディングの停止
+    // Console.WriteLine($"finish recordingId -- > {recordingId}");
+    // await client.GetCallRecording().StopAsync(recordingId).ConfigureAwait(false);
+
     await callConnection.HangUpAsync(true);
 }
 
 app.Run();
+
+// memo
+// https://learn.microsoft.com/ja-jp/azure/communication-services/quickstarts/voice-video-calling/get-started-call-recording?pivots=programming-language-csharp
+// 上によると録画が終わった1,2分後にMicrosoft.Communication.RecordingFileStatusUpdatedが発火され、その中に録画ファイルのURLが含まれるとのこと。
+// このイベントをこちらから確認できるか確かめる必要あり
+// ただ、一度電話を試してみるのはできそう 
