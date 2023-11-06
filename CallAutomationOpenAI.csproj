@@ -12,6 +12,7 @@
     <PackageReference Include="Azure.Communication.Identity" Version="1.0.0-beta.4" />
     <PackageReference Include="Azure.Identity" Version="1.10.3" />
     <PackageReference Include="Azure.Messaging.EventGrid" Version="4.13.0" />
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.18.0" />
     <PackageReference Include="CliWrap" Version="3.6.1" />
     <PackageReference Include="Microsoft.DevTunnels.Connections" Version="1.0.7393" />
     <PackageReference Include="Microsoft.DevTunnels.Contracts" Version="1.0.7393" />
