@@ -74,7 +74,9 @@
   "AcsConnectionString": "Azure Communication Service の接続文字列",
   "AzureOpenAIServiceKey": "AOAI KEY",
   "AzureOpenAIServiceEndpoint": "AOAI ENDPOINT",
-  "AzureOpenAIDeploymentModelName": "AOAI モデル名"
+  "AzureOpenAIDeploymentModelName": "AOAI モデル名",
+  "BlobConnectionString": "Azure Storage の接続文字列",
+  "FunctionsEndpoint": "Function URL"
 }
 ```
 
