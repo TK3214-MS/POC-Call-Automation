@@ -18,9 +18,10 @@ var acsConnectionString = builder.Configuration.GetValue<string>("AcsConnectionS
 //Call Automation Client
 var client = new CallAutomationClient(connectionString: acsConnectionString);
 
-//Blob Service Client
+// build blob service client
 var blobConnectionString = builder.Configuration.GetValue<string>("BlobConnectionString");
 var blobServiceClient = new BlobServiceClient(blobConnectionString);
+
 
 //Grab the Cognitive Services endpoint from appsettings.json
 var cognitiveServicesEndpoint = builder.Configuration.GetValue<string>("CognitiveServiceEndpoint");
@@ -32,7 +33,7 @@ var app = builder.Build();
 var devTunnelUri = builder.Configuration.GetValue<string>("DevTunnelUri");
 var maxTimeout = 2;
 
-//Function Calling Targeted Function の定義
+
 static FunctionDefinition GetFunctionDefinition()
 {
     return new FunctionDefinition()
@@ -117,28 +118,39 @@ app.MapPost("/api/incomingCall", async (
         AnswerCallResult answerCallResult = await client.AnswerCallAsync(options);
         Console.WriteLine($"Answered call for connection id: {answerCallResult.CallConnection.CallConnectionId}");
 
-        string recordingId = "";
-
         //Use EventProcessor to process CallConnected event
         var answer_result = await answerCallResult.WaitForEventProcessorAsync();
         if (answer_result.IsSuccess)
         {
             Console.WriteLine($"Call connected event received for connection id: {answer_result.SuccessResult.CallConnectionId}");
 
-                        // レコーディングの開始
+            // レコーディングの開始
             // var serverCallId = answerCallResult.CallConnectionProperties.ServerCallId;
             var serverCallId = client.GetCallConnection(answer_result.SuccessResult.CallConnectionId).GetCallConnectionProperties().Value.ServerCallId;
             logger.LogInformation($"serverCallId -- > {serverCallId}");
             StartRecordingOptions recordingOptions = new StartRecordingOptions(new ServerCallLocator(serverCallId));
-
+            
+            
+            // MEMO: これによると、録音ファイルはAzure Storageに保存することができそう
             // https://learn.microsoft.com/en-us/azure/communication-services/quickstarts/call-automation/call-recording/bring-your-own-storage?pivots=programming-language-csharp
+            // StartRecordingOptions recordingOptions = new StartRecordingOptions(new ServerCallLocator(serverCallId))
+            // {
+            //     //...
+            //     ExternalStorage = new BlobStorage(new Uri("<Insert Container / Blob Uri>"))
+            // };
+
             var startResponse = await  client.GetCallRecording().StartAsync(recordingOptions).ConfigureAwait(false);
             // var startResponse = await client.GetCallRecording().StartAsync(recordingOptions);
             recordingId = startResponse.Value.RecordingId;
 
+
             var callConnectionMedia = answerCallResult.CallConnection.GetCallMedia();
             await HandleRecognizeAsync(callConnectionMedia, callerId, "お電話ありがとうございます。何をお手伝いしましょう？");
 
+            var statusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
+            logger.LogInformation($"GetRecordingStateAsync response -- > {statusResponse}");
+            logger.LogInformation($"response -- > {startResponse}");
+            logger.LogInformation($"recordingId -- > {recordingId}");
             var statusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
             logger.LogInformation($"GetRecordingStateAsync response -- > {statusResponse}");
             logger.LogInformation($"response -- > {startResponse}");
@@ -190,7 +202,13 @@ app.MapPost("/api/incomingCall", async (
         client.GetEventProcessor().AttachOngoingEventProcessor<CallDisconnected>(answerCallResult.CallConnection.CallConnectionId, async (callDisconnectedEvent) =>
         {
             Console.WriteLine($"Call disconnected event received for connection id: {callDisconnectedEvent.CallConnectionId}. Stopping recording...");
+            // var finishStatusResponse = await client.GetCallRecording().GetStateAsync(recordingId).ConfigureAwait(false);
+
+            // var finishStatusResponse = client.GetCallRecording().GetState(recordingId);
+            // Console.WriteLine($"Finish GetRecordingStateAsync response -- > {finishStatusResponse}");
             // // レコーディングの停止
+            // Console.WriteLine($"finish recordingId -- > {recordingId}");
+            // client.GetCallRecording().Stop(recordingId);
             Console.WriteLine($"finish recording");
         });
 
@@ -227,14 +245,17 @@ app.MapPost("/api/recordingFileStatus", async (
                 };
                 return Results.Ok(responseData);
             }
+
             // Handle the ACS Recording File Status Updated event.
             if (eventData is AcsRecordingFileStatusUpdatedEventData statusUpdated)
             {
                 var contentLocation = statusUpdated.RecordingStorageInfo.RecordingChunks[0].ContentLocation;
                 var deleteLocation = statusUpdated.RecordingStorageInfo.RecordingChunks[0].DeleteLocation;
                 Console.WriteLine($"Recording Download Location : {contentLocation}, Recording Delete Location: {deleteLocation}");
+
                 string timestamp = DateTime.UtcNow.ToString("yyyy-MM-dd-HH-mm");
                 var wavFileName = $"{timestamp}.wav";
+
                 // Download the recording file
                 var response = await client.GetCallRecording().DownloadToAsync(new Uri(contentLocation), wavFileName);
                 // Check the response
@@ -244,10 +265,13 @@ app.MapPost("/api/recordingFileStatus", async (
                     Console.WriteLine($"Error downloading recording file: {errorObj}");
                     return Results.Json(errorObj, statusCode: response.Status);
                 }
+
                 // Upload the file to Azure Blob Storage
                 var blobContainerClient = blobServiceClient.GetBlobContainerClient("recordings");
                 var blobClient = blobContainerClient.GetBlobClient(wavFileName);
+
                 Console.WriteLine($"Uploading to Blob Storage...");
+
                 await using (var stream = new FileStream(wavFileName, FileMode.Open, FileAccess.Read))
                 {
                     await blobClient.UploadAsync(stream, overwrite: true);
@@ -268,6 +292,7 @@ app.MapGet("/api/download", async (HttpContext context) =>
     var recordingDownloadUri = new Uri(url);
     var response = await client.GetCallRecording().DownloadToAsync(recordingDownloadUri, filename);
 });
+
 
 async Task HandleChatResponse(string chatResponse, CallMedia callConnectionMedia, string callerId, ILogger logger)
 {
@@ -318,6 +343,15 @@ async Task<string> GetChatGPTResponse(string speech_input)
 
     var ai_client = new OpenAIClient(new Uri(endpoint), new AzureKeyCredential(key));
     //var ai_client = new OpenAIClient(openAIApiKey: ""); //Use this initializer if you're using a non-Azure OpenAI API Key
+
+    // var chatCompletionsOptions = new ChatCompletionsOptions()
+    // {
+    //     Messages = {
+    //         new ChatMessage(ChatRole.System, "あなたは顧客の困りごとを解決する AI アシスタントです。ユーザーの質問に対して、100文字以内で答えてください。また、リンクの情報を回答する際は、URLは回答から削除してください。"),
+    //         new ChatMessage(ChatRole.User, $"次の質問に対して、100文字以内で答えて: '{speech_input}?'。回答にURLを含む場合は、URLを削除してタイトルのみ回答に含むようにして。"),
+    //                 },
+    //     MaxTokens = 50 // 100文字を目安にトークン数を設定。実際のトークン数は要調整。
+    // };
 
     var chatCompletionsOptions = new ChatCompletionsOptions()
     {
@@ -424,7 +458,19 @@ async Task HandleHangupAsync(CallConnection callConnection, string recordingId)
         VoiceName = "ja-JP-DaichiNeural"
     };
 
+    // var finishStatusResponse = await client.GetCallRecording().GetStateAsync(recordingId);
+    // Console.WriteLine($"GetRecordingStateAsync response -- > {finishStatusResponse}");
+    // // レコーディングの停止
+    // Console.WriteLine($"finish recordingId -- > {recordingId}");
+    // await client.GetCallRecording().StopAsync(recordingId).ConfigureAwait(false);
+
     await callConnection.HangUpAsync(true);
 }
 
 app.Run();
+
+// memo
+// https://learn.microsoft.com/ja-jp/azure/communication-services/quickstarts/voice-video-calling/get-started-call-recording?pivots=programming-language-csharp
+// 上によると録画が終わった1,2分後にMicrosoft.Communication.RecordingFileStatusUpdatedが発火され、その中に録画ファイルのURLが含まれるとのこと。
+// このイベントをこちらから確認できるか確かめる必要あり
+// ただ、一度電話を試してみるのはできそう 
